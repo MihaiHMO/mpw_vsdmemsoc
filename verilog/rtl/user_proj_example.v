@@ -35,15 +35,20 @@
  *-------------------------------------------------------------
  */
 
-module user_proj_example #(
-    parameter BITS = 32
-)(
+module vsdmemsoc #(
+    parameter   [31:0]  BASE_ADDRESS    = 32'h3000_0000,        // base address
+    parameter   [31:0]  MAX_MEM_ADR     = 32'hFF            //  memory capacity (FF = 256)
+      )	(
 `ifdef USE_POWER_PINS
     inout vccd1,	// User area 1 1.8V supply
     inout vssd1,	// User area 1 digital ground
 `endif
-
-    // Wishbone Slave ports (WB MI A)
+    output [9:0] OUT,
+    input ext_clk,
+    input ext_rst,
+    //input init_en,          internal (mem_wr)
+    //input [7:0] init_addr,   replaced by wbs_adr_i
+    //input [31:0] init_data,  replaced by wbs_dat_i
     input wb_clk_i,
     input wb_rst_i,
     input wbs_stb_i,
@@ -52,114 +57,72 @@ module user_proj_example #(
     input [3:0] wbs_sel_i,
     input [31:0] wbs_dat_i,
     input [31:0] wbs_adr_i,
-    output wbs_ack_o,
-    output [31:0] wbs_dat_o,
-
-    // Logic Analyzer Signals
-    input  [127:0] la_data_in,
-    output [127:0] la_data_out,
-    input  [127:0] la_oenb,
-
-    // IOs
-    input  [`MPRJ_IO_PADS-1:0] io_in,
-    output [`MPRJ_IO_PADS-1:0] io_out,
-    output [`MPRJ_IO_PADS-1:0] io_oeb,
-
-    // IRQ
-    output [2:0] irq
+    output reg wbs_ack_o,
+    output reg[31:0] wbs_dat_o	
 );
-    wire clk;
-    wire rst;
+    wire       in_rst;
+    wire        mem_wr_b;      //   write_enable signal for sram  
+    wire [7:0]  mem_addr;    //   address bus for sram
+    wire [31:0] imem_data;   //   sram dout data connection to cpu (instruction mem)
+    wire [7:0]  imem_addr;   //   sram address connection from cpu (instruction mem)
+    wire        mem_clk;            //   sram clk (from system or wishbon)
+    wire [31:0] mem_din ;
+    assign in_rst = ext_rst ? 1'b1 : !wb_rst_i ;            // rv core reset active in case of external reset or when memory is writen Wishbone if is active
+    assign mem_clk = wb_rst_i ? ext_clk : wb_clk_i  ;       // memory clock = ext_clk if wb if is not active and wb clk when wb if is active
+    assign mem_wr_b   = wb_rst_i ? 1'b1 : !wbs_we_i;           // memory write enable  = 1 (inactive) when wb is in reset , tracks wbs_we if wb interface in not in reset 
+    assign mem_addr = wb_rst_i ? imem_addr : wbs_adr_i;
 
-    wire [`MPRJ_IO_PADS-1:0] io_in;
-    wire [`MPRJ_IO_PADS-1:0] io_out;
-    wire [`MPRJ_IO_PADS-1:0] io_oeb;
 
-    wire [31:0] rdata; 
-    wire [31:0] wdata;
-    wire [BITS-1:0] count;
+   always @(posedge wb_clk_i or posedge wb_rst_i) begin
+        if (wb_rst_i) begin 
+        	
+            wbs_dat_o   <=0;
+            wbs_ack_o   <=0;
 
-    wire valid;
-    wire [3:0] wstrb;
-    wire [31:0] la_write;
-
-    // WB MI A
-    assign valid = wbs_cyc_i && wbs_stb_i; 
-    assign wstrb = wbs_sel_i & {4{wbs_we_i}};
-    assign wbs_dat_o = rdata;
-    assign wdata = wbs_dat_i;
-
-    // IO
-    assign io_out = count;
-    assign io_oeb = {(`MPRJ_IO_PADS-1){rst}};
-
-    // IRQ
-    assign irq = 3'b000;	// Unused
-
-    // LA
-    assign la_data_out = {{(127-BITS){1'b0}}, count};
-    // Assuming LA probes [63:32] are for controlling the count register  
-    assign la_write = ~la_oenb[63:32] & ~{BITS{valid}};
-    // Assuming LA probes [65:64] are for controlling the count clk & reset  
-    assign clk = (~la_oenb[64]) ? la_data_in[64]: wb_clk_i;
-    assign rst = (~la_oenb[65]) ? la_data_in[65]: wb_rst_i;
-
-    counter #(
-        .BITS(BITS)
-    ) counter(
-        .clk(clk),
-        .reset(rst),
-        .ready(wbs_ack_o),
-        .valid(valid),
-        .rdata(rdata),
-        .wdata(wbs_dat_i),
-        .wstrb(wstrb),
-        .la_write(la_write),
-        .la_input(la_data_in[63:32]),
-        .count(count)
-    );
-
-endmodule
-
-module counter #(
-    parameter BITS = 32
-)(
-    input clk,
-    input reset,
-    input valid,
-    input [3:0] wstrb,
-    input [BITS-1:0] wdata,
-    input [BITS-1:0] la_write,
-    input [BITS-1:0] la_input,
-    output ready,
-    output [BITS-1:0] rdata,
-    output [BITS-1:0] count
-);
-    reg ready;
-    reg [BITS-1:0] count;
-    reg [BITS-1:0] rdata;
-
-    always @(posedge clk) begin
-        if (reset) begin
-            count <= 0;
-            ready <= 0;
-        end else begin
-            ready <= 1'b0;
-            if (~|la_write) begin
-                count <= count + 1;
-            end
-            if (valid && !ready) begin
-                ready <= 1'b1;
-                rdata <= count;
-                if (wstrb[0]) count[7:0]   <= wdata[7:0];
-                if (wstrb[1]) count[15:8]  <= wdata[15:8];
-                if (wstrb[2]) count[23:16] <= wdata[23:16];
-                if (wstrb[3]) count[31:24] <= wdata[31:24];
-            end else if (|la_write) begin
-                count <= la_write & la_input;
-            end
+        end else if (wbs_cyc_i && wbs_stb_i && !wbs_ack_o && wbs_we_i && (wbs_dat_i >= BASE_ADDRESS  && wbs_dat_i <= BASE_ADDRESS + MAX_MEM_ADR))begin // sram write 
+            if (wbs_sel_i[0] ) mem_din[7:0]   <= wbs_dat_i[7:0] ;
+            if (wbs_sel_i[1] ) mem_din[15:8]  <= wbs_dat_i[15:8] ; 
+            if (wbs_sel_i[2] ) mem_din[23:16] <= wbs_dat_i[23:16] ;
+            if (wbs_sel_i[3] ) mem_din[31:24] <= wbs_dat_i[31:24] ;
+            wbs_ack_o <= 1;
+        end else if (wbs_cyc_i && wbs_stb_i && !wbs_ack_o && !wbs_we_i) begin // sram read 
+            wbs_dat_o <= imem_data;
+            wbs_ack_o <= 1;
+        end else begin 
+            wbs_ack_o <= 0;
+            wbs_dat_o <= 32'b0;
         end
     end
+   
+ 
+    rvmyth core (
+        .OUT(OUT),
+        .CLK(ext_clk),
+        .reset(in_rst),
 
+        .imem_addr(imem_addr),
+        .imem_data(imem_data)
+    );
+    
+    sky130_sram_1kbyte_1rw1r_32x256_8 mem (
+`ifdef USE_POWER_PINS
+        .vccd1(vccd1),	// User area 1 1.8V supply
+        .vssd1(vssd1),	// User area 1 digital ground
+`endif
+        // Port 0: RW
+        .clk0(mem_clk),
+        .csb0(1'b0),
+        .web0(mem_wr_b),
+        .wmask0(4'b1111),
+        .addr0(mem_addr),
+        .din0(wbs_dat_i),
+        .dout0(imem_data),
+        
+        // Port 1: R
+        .clk1(mem_clk),
+        .csb1(1'b1),
+        .addr1(mem_addr),
+        .dout1()
+    );
 endmodule
 `default_nettype wire
